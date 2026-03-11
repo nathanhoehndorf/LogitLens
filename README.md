@@ -31,5 +31,5 @@ uv run streamlit run interface.py
     - The **Y-axis** represents the layers of the model.
     - Hover over any cell to see the top predicted word at that specific layer and its confidence score.
 
-#### Tools Used
+## Tools Used
 `TransformerLens`, `Streamlit`, `Plotly`, and `uv`.
