@@ -1,0 +1,11 @@
+# Environments
+.venv/
+env/
+
+# Python Cache
+__pycache__/
+*.pyc
+
+# Streamlit and TransformerLens Cache
+.streamlit/
+~/.cache/huggingface
