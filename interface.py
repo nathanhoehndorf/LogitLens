@@ -59,7 +59,8 @@ class TunedLens(nn.Module):
                 # Get final logits and intermediate representations
                 with torch.no_grad():
                     final_logits, cache = self.model.run_with_cache(batch_tokens)
-                    target_ids = batch_tokens[:, 1:]
+                    final_target_logits = final_logits[:, :-1, :].detach()  # Shift by 1 to align with predictions
+                    final_target_probs = torch.softmax(final_target_logits, dim=-1)
                 
                 # Train each probe
                 for layer in range(self.n_layers):
@@ -70,9 +71,10 @@ class TunedLens(nn.Module):
                     
                     # Get probe predictions
                     probe_logits = self.probes[layer](resid_stream)
+                    probe_log_probs = torch.log_softmax(probe_logits, dim=-1)
                     
-                    # Compute loss (cross entropy with true next-token ids)
-                    loss = criterion(probe_logits.view(-1, self.d_vocab), target_ids.view(-1))
+                    # Compute soft cross-entropy loss to final model distribution
+                    loss = - (final_target_probs.view(-1, self.d_vocab) * probe_log_probs.view(-1, self.d_vocab)).sum(dim=-1).mean()
                     loss.backward()
                     optimizer.step()
                     
