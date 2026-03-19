@@ -1,7 +1,9 @@
 # LogitLens
 A web-based interactive tool to visualize how Large Language Models build their predictions layer-by-layer, built with Streamlit, Plotly, and TransformerLens.
 
-This tools implements a **Logit Lens**, a foundational interpretability technique introduced in my Large Language Models course that interrupts the forward pass of an LLM at intermediate layers, applies the final layer normalization and unembedding, and reveals what the model "thinks" the next word will be before the final output.
+This tool implements both **Logit Lens** and **Tuned Lens** techniques for LLM interpretability:
+- **Logit Lens**: Interrupts the forward pass at intermediate layers, applies final layer normalization and unembedding to reveal what the model "thinks" the next word will be.
+- **Tuned Lens**: Uses pre-trained linear probes to provide better-calibrated predictions by accounting for transformations between layers.
 
 ## Setup and Start
 
@@ -24,12 +26,16 @@ uv run streamlit run interface.py
 ```
 
 ## How to Use
-1. **Enter a Prompt:** Type an incomplete sentence into the text box (e.g., "The capital of France is").
-2. **Wait for Inference:** App downloads a small model and runs the forward pass.
-3. **Explore the Heatmap:**
+1. **Choose Lens Type:** Select between "Logit Lens" or "Tuned Lens" using the radio buttons.
+2. **Enter a Prompt:** Type an incomplete sentence into the text box (e.g., "The capital of France is").
+3. **Wait for Inference:** App downloads GPT-2 model and runs the forward pass.
+4. **Explore the Heatmap:**
     - The **X-axis** represents the input tokens.
     - The **Y-axis** represents the layers of the model.
     - Hover over any cell to see the top predicted word at that specific layer and its confidence score.
 
+## Model
+The tool uses GPT-2, which has pre-trained tuned lenses available for more accurate interpretability.
+
 ## Tools Used
-`TransformerLens`, `Streamlit`, `Plotly`, and `uv`.
+`TransformerLens`, `Streamlit`, `Plotly`, `tuned-lens`, and `uv`.

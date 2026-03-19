@@ -2,7 +2,7 @@ from transformer_lens import HookedTransformer
 import torch
 
 # 1. Load the model
-model: HookedTransformer = HookedTransformer.from_pretrained("pythia-14m")
+model: HookedTransformer = HookedTransformer.from_pretrained("gpt2")
 
 # 2. Define the prompt (we leave off "green" to see how the model predicts it)
 prompt = "The sky is blue and the grass is"

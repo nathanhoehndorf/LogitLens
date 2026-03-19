@@ -2,19 +2,29 @@ import streamlit as st
 import plotly.graph_objects as go
 import torch
 from transformer_lens import HookedTransformer
+from tuned_lens import TunedLens
+from transformers import AutoModelForCausalLM
 
 # 1. Cache the model so it doesn't reload every time you type a letter in the GUI
 @st.cache_resource
 def load_model():
-    # Pythia-14m is great for fast testing!
-    return HookedTransformer.from_pretrained("pythia-14m")
+    # GPT-2 has pre-trained tuned lenses available
+    model = HookedTransformer.from_pretrained("gpt2")
+    tf_model = AutoModelForCausalLM.from_pretrained("gpt2")
+    try:
+        tuned_lens = TunedLens.from_model_and_pretrained(tf_model)
+    except Exception as e:
+        tuned_lens = None
+        print(f"Tuned Lens not available: {e}")
+    return model, tuned_lens
 
 st.title("🔍 Interactive Logit Lens")
 st.markdown("Observe how the model builds its predictions layer-by-layer.")
 
-model = load_model()
+model, tuned_lens = load_model()
 
 # 2. The GUI Input
+lens_type = st.radio("Choose Lens Type:", ["Logit Lens", "Tuned Lens"])
 prompt = st.text_input("Enter a prompt:", "The sky is blue and the grass is")
 
 if prompt:
@@ -42,9 +52,19 @@ if prompt:
         hook_name = f"blocks.{layer}.hook_resid_post"
         residual_stream = cache[hook_name][0] # Shape: [seq_len, d_model]
         
-        # Apply layer norm and unembed
-        normalized_state = model.ln_final(residual_stream)
-        layer_logits = model.unembed(normalized_state) # Shape: [seq_len, d_vocab]
+        if lens_type == "Logit Lens":
+            # Apply layer norm and unembed
+            normalized_state = model.ln_final(residual_stream)
+            layer_logits = model.unembed(normalized_state) # Shape: [seq_len, d_vocab]
+        else:
+            if tuned_lens is None:
+                st.error("Tuned Lens not available for this model. Using Logit Lens instead.")
+                normalized_state = model.ln_final(residual_stream)
+                layer_logits = model.unembed(normalized_state)
+            else:
+                # Tuned lens expects [batch, seq, d_model]
+                layer_logits = tuned_lens(residual_stream.unsqueeze(0), layer).squeeze(0)
+        
         layer_probs = torch.softmax(layer_logits, dim=-1)
         
         layer_hover_text = []
