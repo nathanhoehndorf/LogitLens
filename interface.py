@@ -1,21 +1,118 @@
 import streamlit as st
 import plotly.graph_objects as go
 import torch
+import torch.nn as nn
 from transformer_lens import HookedTransformer
-from tuned_lens import TunedLens
 from transformers import AutoModelForCausalLM
+
+class TunedLens(nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+        self.n_layers = model.cfg.n_layers
+        self.d_model = model.cfg.d_model
+        self.d_vocab = model.cfg.d_vocab
+        
+        # Create linear probes for each layer
+        self.probes = nn.ModuleList([
+            nn.Linear(self.d_model, self.d_vocab) for _ in range(self.n_layers)
+        ])
+        
+    def train_probes(self, texts, batch_size=4, epochs=5, lr=1e-3):
+        """Train the probes on a dataset of texts"""
+        optimizer = torch.optim.Adam(self.probes.parameters(), lr=lr)
+        criterion = nn.CrossEntropyLoss()
+        
+        # Tokenize all texts
+        all_tokens = []
+        for text in texts:
+            tokens = self.model.to_tokens(text)
+            if tokens.shape[1] > 1:  # Ensure we have at least one token to predict
+                all_tokens.append(tokens)
+        
+        if not all_tokens:
+            return
+            
+        # Training loop
+        for epoch in range(epochs):
+            total_loss = 0
+            n_batches = 0
+            
+            # Shuffle and batch
+            indices = torch.randperm(len(all_tokens))
+            for i in range(0, len(all_tokens), batch_size):
+                batch_indices = indices[i:i+batch_size]
+                batch_tokens = [all_tokens[idx] for idx in batch_indices]
+                
+                # Pad to same length
+                max_len = max(t.shape[1] for t in batch_tokens)
+                padded_batch = []
+                for tokens in batch_tokens:
+                    if tokens.shape[1] < max_len:
+                        pad_len = max_len - tokens.shape[1]
+                        padding = torch.zeros((tokens.shape[0], pad_len), dtype=tokens.dtype, device=tokens.device)
+                        tokens = torch.cat([tokens, padding], dim=1)
+                    padded_batch.append(tokens)
+                
+                batch_tokens = torch.cat(padded_batch, dim=0)
+                
+                # Get final logits and intermediate representations
+                with torch.no_grad():
+                    final_logits, cache = self.model.run_with_cache(batch_tokens)
+                    target_ids = batch_tokens[:, 1:]
+                
+                # Train each probe
+                for layer in range(self.n_layers):
+                    optimizer.zero_grad()
+                    
+                    hook_name = f"blocks.{layer}.hook_resid_post"
+                    resid_stream = cache[hook_name][:, :-1]  # Remove last token (no prediction needed)
+                    
+                    # Get probe predictions
+                    probe_logits = self.probes[layer](resid_stream)
+                    
+                    # Compute loss (cross entropy with true next-token ids)
+                    loss = criterion(probe_logits.view(-1, self.d_vocab), target_ids.view(-1))
+                    loss.backward()
+                    optimizer.step()
+                    
+                    total_loss += loss.item()
+                    n_batches += 1
+            
+            if epoch % 2 == 0:
+                print(f"Epoch {epoch}, Avg Loss: {total_loss / n_batches:.4f}")
+    
+    def forward(self, hidden_states, layer):
+        """Apply the tuned lens probe for a specific layer"""
+        return self.probes[layer](hidden_states)
 
 # 1. Cache the model so it doesn't reload every time you type a letter in the GUI
 @st.cache_resource
 def load_model():
     # GPT-2 has pre-trained tuned lenses available
     model = HookedTransformer.from_pretrained("gpt2")
-    tf_model = AutoModelForCausalLM.from_pretrained("gpt2")
-    try:
-        tuned_lens = TunedLens.from_model_and_pretrained(tf_model)
-    except Exception as e:
-        tuned_lens = None
-        print(f"Tuned Lens not available: {e}")
+    
+    # Create and train custom tuned lens
+    tuned_lens = TunedLens(model)
+    
+    # Train on some sample texts
+    training_texts = [
+        "The sky is blue and the grass is",
+        "The capital of France is",
+        "Machine learning is",
+        "The weather today is",
+        "I like to eat",
+        "The best programming language is",
+        "In the future, AI will",
+        "The color of the ocean is",
+        "My favorite food is",
+        "The largest planet is"
+    ]
+    
+    print("Training tuned lens probes...")
+    tuned_lens.train_probes(training_texts, epochs=10)
+    print("Tuned lens training complete!")
+    
     return model, tuned_lens
 
 st.title("🔍 Interactive Logit Lens")
@@ -57,13 +154,8 @@ if prompt:
             normalized_state = model.ln_final(residual_stream)
             layer_logits = model.unembed(normalized_state) # Shape: [seq_len, d_vocab]
         else:
-            if tuned_lens is None:
-                st.error("Tuned Lens not available for this model. Using Logit Lens instead.")
-                normalized_state = model.ln_final(residual_stream)
-                layer_logits = model.unembed(normalized_state)
-            else:
-                # Tuned lens expects [batch, seq, d_model]
-                layer_logits = tuned_lens(residual_stream.unsqueeze(0), layer).squeeze(0)
+            # Tuned lens expects [batch, seq, d_model]
+            layer_logits = tuned_lens(residual_stream.unsqueeze(0), layer).squeeze(0)
         
         layer_probs = torch.softmax(layer_logits, dim=-1)
         

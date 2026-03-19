@@ -3,7 +3,7 @@ A web-based interactive tool to visualize how Large Language Models build their 
 
 This tool implements both **Logit Lens** and **Tuned Lens** techniques for LLM interpretability:
 - **Logit Lens**: Interrupts the forward pass at intermediate layers, applies final layer normalization and unembedding to reveal what the model "thinks" the next word will be.
-- **Tuned Lens**: Uses pre-trained linear probes to provide better-calibrated predictions by accounting for transformations between layers.
+- **Tuned Lens**: A custom implementation that trains linear probes at each layer to predict the final logits from intermediate representations, providing better-calibrated predictions.
 
 ## Setup and Start
 
@@ -38,4 +38,4 @@ uv run streamlit run interface.py
 The tool uses GPT-2, which has pre-trained tuned lenses available for more accurate interpretability.
 
 ## Tools Used
-`TransformerLens`, `Streamlit`, `Plotly`, `tuned-lens`, and `uv`.
+`TransformerLens`, `Streamlit`, `Plotly`, and `uv`.
