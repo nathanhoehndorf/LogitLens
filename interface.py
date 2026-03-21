@@ -1,3 +1,4 @@
+import os
 import streamlit as st
 import plotly.graph_objects as go
 import torch
@@ -6,44 +7,57 @@ from transformer_lens import HookedTransformer
 from transformers import AutoModelForCausalLM
 
 class TunedLens(nn.Module):
-    def __init__(self, model):
+    def __init__(self, n_layers, d_model, d_vocab):
         super().__init__()
-        self.model = model
-        self.n_layers = model.cfg.n_layers
-        self.d_model = model.cfg.d_model
-        self.d_vocab = model.cfg.d_vocab
+        self.n_layers = n_layers
+        self.d_model = d_model
+        self.d_vocab = d_vocab
         
         # Create linear probes for each layer
         self.probes = nn.ModuleList([
             nn.Linear(self.d_model, self.d_vocab) for _ in range(self.n_layers)
         ])
         
-    def train_probes(self, texts, batch_size=4, epochs=5, lr=1e-3):
+    def train_probes(self, model, texts, batch_size=4, epochs=5, lr=1e-3):
         """Train the probes on a dataset of texts"""
         optimizer = torch.optim.Adam(self.probes.parameters(), lr=lr)
-        criterion = nn.CrossEntropyLoss()
         
         # Tokenize all texts
         all_tokens = []
         for text in texts:
-            tokens = self.model.to_tokens(text)
-            if tokens.shape[1] > 1:  # Ensure we have at least one token to predict
-                all_tokens.append(tokens)
+            try:
+                tokens = model.to_tokens(text)
+                if tokens.shape[1] > 1:  # Ensure we have at least one token to predict
+                    all_tokens.append(tokens)
+            except:
+                continue  # Skip problematic texts
         
         if not all_tokens:
             return
             
-        # Training loop
+        print(f"Training on {len(all_tokens)} text samples for {epochs} epochs")
+        
+        # Training loop: 5 epochs, up to 10 batches per epoch (no data repetition)
+        batches_per_epoch = 10
+
+        all_batches = (len(all_tokens) + batch_size - 1) // batch_size
+        batch_count = min(batches_per_epoch, all_batches)
+
         for epoch in range(epochs):
-            total_loss = 0
+            print(f"Starting epoch {epoch+1}/{epochs}")
+            total_loss = 0.0
             n_batches = 0
-            
-            # Shuffle and batch
+
+            # Shuffle all token indices each epoch
             indices = torch.randperm(len(all_tokens))
-            for i in range(0, len(all_tokens), batch_size):
-                batch_indices = indices[i:i+batch_size]
+
+            for batch_id in range(batch_count):
+                start = batch_id * batch_size
+                end = min(start + batch_size, len(all_tokens))
+                batch_indices = indices[start:end]
+                print(f"Processing batch {batch_id+1}/{batch_count} (data {start}:{end})")
                 batch_tokens = [all_tokens[idx] for idx in batch_indices]
-                
+
                 # Pad to same length
                 max_len = max(t.shape[1] for t in batch_tokens)
                 padded_batch = []
@@ -53,36 +67,40 @@ class TunedLens(nn.Module):
                         padding = torch.zeros((tokens.shape[0], pad_len), dtype=tokens.dtype, device=tokens.device)
                         tokens = torch.cat([tokens, padding], dim=1)
                     padded_batch.append(tokens)
-                
+
                 batch_tokens = torch.cat(padded_batch, dim=0)
-                
-                # Get final logits and intermediate representations
+                print(f"Batch shape: {batch_tokens.shape}")
+
+                # Get final logits and intermediate representations once
+                print("Running model forward pass...")
                 with torch.no_grad():
-                    final_logits, cache = self.model.run_with_cache(batch_tokens)
+                    final_logits, cache = model.run_with_cache(batch_tokens)
                     final_target_logits = final_logits[:, :-1, :].detach()  # Shift by 1 to align with predictions
                     final_target_probs = torch.softmax(final_target_logits, dim=-1)
-                
-                # Train each probe
+
+                print("Computing losses...")
+                layer_losses = []
                 for layer in range(self.n_layers):
-                    optimizer.zero_grad()
-                    
                     hook_name = f"blocks.{layer}.hook_resid_post"
-                    resid_stream = cache[hook_name][:, :-1]  # Remove last token (no prediction needed)
-                    
-                    # Get probe predictions
+                    resid_stream = cache[hook_name][:, :-1]
                     probe_logits = self.probes[layer](resid_stream)
                     probe_log_probs = torch.log_softmax(probe_logits, dim=-1)
-                    
-                    # Compute soft cross-entropy loss to final model distribution
-                    loss = - (final_target_probs.view(-1, self.d_vocab) * probe_log_probs.view(-1, self.d_vocab)).sum(dim=-1).mean()
-                    loss.backward()
-                    optimizer.step()
-                    
-                    total_loss += loss.item()
-                    n_batches += 1
-            
-            if epoch % 2 == 0:
-                print(f"Epoch {epoch}, Avg Loss: {total_loss / n_batches:.4f}")
+                    loss = - (final_target_probs.reshape(-1, self.d_vocab) * probe_log_probs.reshape(-1, self.d_vocab)).sum(dim=-1).mean()
+                    layer_losses.append(loss)
+
+                print("Updating parameters...")
+                optimizer.zero_grad()
+                total_batch_loss = sum(layer_losses)
+                total_batch_loss.backward()
+                optimizer.step()
+
+                total_loss += total_batch_loss.item()
+                n_batches += 1
+
+            avg_loss = total_loss / n_batches if n_batches > 0 else float('nan')
+            print(f"Epoch {epoch+1}/{epochs}, Avg Loss: {avg_loss:.4f}")
+
+        print("Training finished; GUI is now active")
     
     def forward(self, hidden_states, layer):
         """Apply the tuned lens probe for a specific layer"""
@@ -93,40 +111,101 @@ class TunedLens(nn.Module):
 def load_model():
     # GPT-2 has pre-trained tuned lenses available
     model = HookedTransformer.from_pretrained("gpt2")
+    return model
+
+@st.cache_resource
+def load_tuned_lens_state_dict():
+    state_path = "tuned_lens_state.pt"
+    if os.path.exists(state_path):
+        print(f"Loading saved tuned lens state dict from {state_path}")
+        return torch.load(state_path)
+
+    # Create a temporary model just for training (this won't be cached)
+    model = HookedTransformer.from_pretrained("gpt2")
     
-    # Create and train custom tuned lens
-    tuned_lens = TunedLens(model)
+    # Create and train custom tuned lens using ALL available stories
+    tuned_lens = TunedLens(model.cfg.n_layers, model.cfg.d_model, model.cfg.d_vocab)
     
-    # Train on some sample texts
-    training_texts = [
-        "The sky is blue and the grass is",
-        "The capital of France is",
-        "Machine learning is",
-        "The weather today is",
-        "I like to eat",
-        "The best programming language is",
-        "In the future, AI will",
-        "The color of the ocean is",
-        "My favorite food is",
-        "The largest planet is"
-    ]
+    # Load training texts from tinystories_10k.txt
+    try:
+        with open("tinystories_10k.txt", "r", encoding="utf-8", errors="ignore") as f:
+            full_text = f.read()
+        # Split by end-of-text token
+        training_texts = [story.strip() for story in full_text.split("<|endoftext|>")]
+        # Filter out empty or very short stories
+        training_texts = [s for s in training_texts if len(s) > 50]
+        print(f"Loaded {len(training_texts)} training stories from tinystories_10k.txt")
+    except FileNotFoundError:
+        print("tinystories_10k.txt not found, using default training texts")
+        training_texts = [
+            "The sky is blue and the grass is green",
+            "The capital of France is Paris",
+            "Machine learning is awesome",
+            "The weather today is sunny",
+            "I like to eat pizza",
+            "The best programming language is Python",
+            "In the future, AI will rule the world",
+            "The color of the ocean is blue",
+            "My favorite food is pizza",
+            "The largest planet is Jupiter"
+        ]
     
     print("Training tuned lens probes...")
-    tuned_lens.train_probes(training_texts, epochs=10)
+    tuned_lens.train_probes(model, training_texts, epochs=5, batch_size=16)
     print("Tuned lens training complete!")
+
+    state_path = "tuned_lens_state.pt"
+    torch.save(tuned_lens.state_dict(), state_path)
+    print(f"Saved tuned lens state dict to {state_path}")
     
-    return model, tuned_lens
+    # Return only the state dict for caching
+    return tuned_lens.state_dict()
+
+def get_tuned_lens(model):
+    # Load cached state dict and create TunedLens instance
+    state_dict = load_tuned_lens_state_dict()
+    tuned_lens = TunedLens(model.cfg.n_layers, model.cfg.d_model, model.cfg.d_vocab)
+    tuned_lens.load_state_dict(state_dict)
+    return tuned_lens
 
 st.title("🔍 Interactive Logit Lens")
 st.markdown("Observe how the model builds its predictions layer-by-layer.")
 
-model, tuned_lens = load_model()
+model = load_model()
+
+if "tuned_lens_state" not in st.session_state:
+    st.session_state.tuned_lens_state = None
+
+if "tuned_lens_trained" not in st.session_state:
+    st.session_state.tuned_lens_trained = False
+
+if "tuned_lens_obj" not in st.session_state:
+    st.session_state.tuned_lens_obj = None
+
+if not st.session_state.tuned_lens_trained:
+    with st.expander("Tuned Lens setup"):
+        st.write("TunedLens is not trained yet.")
+        if st.button("Start TunedLens Training"):
+            with st.spinner("Training TunedLens — this may take several minutes..."):
+                state_dict = load_tuned_lens_state_dict()
+                st.session_state.tuned_lens_state = state_dict
+                st.session_state.tuned_lens_obj = TunedLens(model.cfg.n_layers, model.cfg.d_model, model.cfg.d_vocab)
+                st.session_state.tuned_lens_obj.load_state_dict(state_dict)
+                st.session_state.tuned_lens_trained = True
+                st.success("TunedLens trained and ready. ✅")
+
+if st.session_state.tuned_lens_trained:
+    tuned_lens = st.session_state.tuned_lens_obj
+else:
+    tuned_lens = None
 
 # 2. The GUI Input
 lens_type = st.radio("Choose Lens Type:", ["Logit Lens", "Tuned Lens"])
 prompt = st.text_input("Enter a prompt:", "The sky is blue and the grass is")
 
 if prompt:
+    if lens_type == "Tuned Lens" and st.session_state.tuned_lens_trained is not True:
+        st.warning("TunedLens is not trained yet. Please click the training button.")
     # Tokenize and run the model
     tokens = model.to_tokens(prompt)
     str_tokens = model.to_str_tokens(tokens)
@@ -163,19 +242,22 @@ if prompt:
         
         layer_hover_text = []
         for pos in range(seq_len):
-            # What is the probability of the token that the model ULTIMATELY predicts?
+            # What is THIS specific layer's top guess and its confidence?
+            top_guess_id = layer_logits[pos].argmax().item()
+            top_guess_prob = layer_probs[pos, top_guess_id].item()
+            top_guess_str = model.to_string(top_guess_id)
+            
+            # Also show confidence in the final prediction
             target_id = final_token_ids[pos]
             prob_of_target = layer_probs[pos, target_id].item()
-            heatmap_probs[layer, pos] = prob_of_target
             
-            # What is THIS specific layer's top guess?
-            top_guess_id = layer_logits[pos].argmax().item()
-            top_guess_str = model.to_string(top_guess_id)
+            heatmap_probs[layer, pos] = top_guess_prob
             
             # Format the interactive hover text
             hover_text = (
                 f"Input Token: {str_tokens[pos]!r}<br>"
                 f"Layer {layer} Top Guess: <b>{top_guess_str!r}</b><br>"
+                f"Layer Confidence: {top_guess_prob:.2%}<br>"
                 f"Final Prediction: {final_token_strs[pos]!r}<br>"
                 f"Confidence in Final: {prob_of_target:.2%}"
             )
@@ -191,15 +273,15 @@ if prompt:
         text=hover_labels,
         hoverinfo="text",
         colorscale="Viridis", # "Magma" or "Inferno" also look great
-        colorbar_title="Probability"
+        colorbar_title="Layer Confidence"
     ))
     
     fig.update_layout(
-        title="Evolution of Final Prediction Probability",
+        title="Evolution of Layer Prediction Confidence",
         xaxis_title="Input Sequence",
         yaxis_title="Model Layer",
         xaxis_nticks=len(str_tokens)
     )
     
     # Render in Streamlit
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')

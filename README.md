@@ -2,35 +2,45 @@
 
 ## LogitLens
 
-**Implementation:** Extracts intermediate predictions by directly unembedding the residual stream at each layer. For each layer, we extract the residual stream from the cache at `blocks.{layer}.hook_resid_post`, apply the model's final layer normalization, project to vocabulary space with the unembedding matrix, and track the probability of the model's final prediction. This method is fast and requires no training, but doesn't account for representational drift between layers.
+### Full Heatmap
+![images/logitlensfg1](images/logitlensfg1.png)
 
-![logit_lens_figure1](images/logit_lens_fg1.png)
+### Zoomed-In Region
 
-We see that we start getting some higher confidences in the next token prediction as the layers go up, and the model gets pretty darn sure that "grass" gets followed by "is".
+![images/logitlensfg2](images/logitlensfg2.png)
 
-![logit_lens_figure2](images/logit_lens_fg2.png)
+### Failure Case
 
-The model actually starts to lose some confidence as time goes on, but multiple tokens starting having higher confidence in the later layers, if only by 10%. I thought it was interesting that the model liked "of the" at the beginning and then lost it more towards the end, since "of the" is probably a pretty common phrase in English.
+![images/logitlensfg4](images/logitlensfg4.png)
 
-![logit_lens_figure3](images/logit_lens_fg3.png)
+### Analysis
+Predictions generally sharpen with depth when well-behaved. Earlier layers always have diffuse distributions and rarely have more than a single high-confidence value, of which are usually bad answers. In later layers, it would be wrong to say it's usually any better, but it can be! When it is, we have higher-confidence predictions on a few tokens since there's more time for computation and later layers are refining the earlier predictions.
 
-Pythia liked "is now" even more than it liked "of the", for a while. We are still seeing the increase in confidence across the token and across the layers that we want, though. No, I will no divulge my opinion to the question.
+Early predictions are consistently wrong and unstable. This really just means that the intermediate layers aren't aligning with the output we would like to see.
+
+Logit lens is useful because it allows us to "look under the hood" layer-by-layer without having to train the model. It reveals when predictions occur, or when a token dominates confidence. You can also see late corrections and early mispredictions, which can aid in debugging.
+
+Logit lens has a few problems, though. Unembedding doesn't make a lot of sense early, since the residual stream at a given layer isn't reflecting the final logit. Further, due to the initial randomization of parameters, early wrong guesses don't mean anything and don't necessarily reflect and actual computed answer. Further, just because we see a token early, and just because it stays for a while, doesn't mean it's the model's decision. It might still come out of left field with some beautiful, grammatically-correct 99% confidence answer on the last layer. These limitations suggest that the issue isn't necessarily the absence of predictive information early on but rather that the information isn't accesible until the final output.
 
 ## Tuned Lens
 
-**Implementation:** A custom implementation with trainable linear probes at each layer. The approach creates one `nn.Linear(d_model, d_vocab)` probe per layer, trained via soft cross-entropy loss against the model's own final probability distribution. During training on sample sentences, each probe learns to minimize `-∑(P_final * log(P_probe))`, enabling it to account for representational drift and learn meaningful layer-wise transformations. Trained on 10 sample texts for 10 epochs, the probes output calibrated logits that surface how confidence evolves across layers.
+### Full heatmap
 
-![tuned_lens_figure1](images/tuned_lens_fg1.png)
+![images/tunedlensfg1.png](images/tunedlensfg1.png)
 
-It caught on to the fact that the sky is something, but it didn't learn anything about grass. No colors showed up in the top predictions for is, which I thought was interesting.
+### Zoomed-In Region
 
-![tuned_lens_figure2](images/tuned_lens_fg2.png)
+![images/tunedlensfg2.png](images/tunedlensfg2.png)
 
-We actually see a somewhat reversed effect here, where most tokens actually get less confident as time goes on, with the exception of France. I thought it was cool that it predicted a comma would come next with high confidence, since every reference to France at a certain time would be formatted like France, 19XX or something. However, I feel like that doesn't show up enough for it to be >80% sure every single layer. 
+### Analysis
 
-![tuned_lens_figure3](images/tuned_lens_fg3.png)
+We see the correct tokens emerging with non-trivial probability a little earlier in Tuned Lens when compared to Logit Lens. This might mean that information exists earlier than the logit lens suggests. We also see smoother layer-to-layer transitions in token probability, maybe because the learned nature of the projections align better with the final result. Further, there is just less noise for the earlier layers, and the top 5 tokens stay more stable than they did in the logit lens.
 
-Besides a single confident guess of "at the" at the very end, the only confidence above 15% was the guess of "best way" at every layer.
+Tuned Lens is useful because it corrects the misalignment in logit lens by having layer-specific linear maps that approximate the decoding back into tokens. It more accurately shows the intermediate computation and reveals earlier structure. Also, with less noisy signals we can do more interpretability with it.
+
+It still only uses linear transformations which I have to image are limiting in some way in terms of the model's ability to approximate. Further, it requires training which just takes some energy and time that you didn't have to spend with the logit lens. Also, there might be an overfitting concern with all the training that's going on, it might just be picking up on some patterns. Also, just because we can see tokens earlier with less noise doesn't mean that the model is actually getting closer to deciding that token earlier.
+
+Basically, these results are suggesting that information is distributed across layers, but it isn't all accessible. The logit lens provides a simple, miscalibrated view, while the tuned lens provides an improved view with additional assumptions and compute.
 
 # LogitLens
 A web-based interactive tool to visualize how Large Language Models build their predictions layer-by-layer, built with Streamlit, Plotly, and TransformerLens.
